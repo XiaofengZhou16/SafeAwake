@@ -4,38 +4,104 @@ import SwiftUI
 
 @main
 struct SafeAwakeApp: App {
-    @StateObject private var controller = WakeController()
+    @NSApplicationDelegateAdaptor(AwakeAppDelegate.self) private var delegate
 
     var body: some Scene {
         MenuBarExtra {
-            SafeAwakeMenu(controller: controller)
+            SafeAwakeMenu(controller: delegate.controller)
         } label: {
-            Image(systemName: controller.isActive ? "cup.and.saucer.fill" : "cup.and.saucer")
-                .accessibilityLabel(controller.isActive ? "SafeAwake 已开启" : "SafeAwake 已关闭")
+            AwakeMenuLabel(controller: delegate.controller)
         }
         .menuBarExtraStyle(.window)
     }
 }
 
+@MainActor
+final class AwakeAppDelegate: NSObject, NSApplicationDelegate {
+    let controller = WakeController()
+    private var panel: NSWindow?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        if CommandLine.arguments.contains("--show-panel") { showPanel() }
+    }
+
+    @objc private func didWake() { controller.refresh() }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        controller.stop(feedback: nil)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showPanel()
+        return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    private func showPanel() {
+        if panel == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 372, height: 550),
+                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = "SafeAwake"
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: SafeAwakeMenu(controller: controller))
+            window.center()
+            panel = window
+        }
+        panel?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+private struct AwakeMenuLabel: View {
+    @ObservedObject var controller: WakeController
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: controller.isActive ? "cup.and.saucer.fill" : "cup.and.saucer")
+            if controller.isActive { Text(controller.menuBarText).monospacedDigit() }
+        }
+        .accessibilityLabel(controller.isActive ? "SafeAwake 剩余 \(controller.menuBarText)" : "SafeAwake 已关闭")
+    }
+}
+
 private struct SafeAwakeMenu: View {
     @ObservedObject var controller: WakeController
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var showsDetails = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
             statusCard
 
-            if let feedback = controller.feedbackMessage {
-                FeedbackBadge(message: feedback, tone: controller.feedbackTone)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+            Group {
+                if let feedback = controller.feedbackMessage {
+                    FeedbackBadge(message: feedback, tone: controller.feedbackTone)
+                } else {
+                    Label("熄屏继续工作 · 随时一键停止", systemImage: "display")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
             }
+            .frame(height: 40)
 
             durationCard
-            powerCard
             actionCard
+            DisclosureGroup("电源与使用说明", isExpanded: $showsDetails) {
+                VStack(alignment: .leading, spacing: 8) {
+                    powerCard
+                    Text("电池供电时，电量 ≤20% 或无法读取将停止保持唤醒。关闭 SafeAwake 不会强制电脑立即睡眠。")
+                    Text("请保持上盖打开。合盖工作需使用 Apple 支持的外接显示器闭盖模式。熄屏不会主动锁定电脑，离开前可按 ⌃⌘Q 锁屏。")
+                }
+                .font(.system(size: 12)).foregroundStyle(.secondary)
+                .padding(.top, 8)
+            }
+            .font(.system(size: 12))
             footer
         }
         .padding(14)
-        .frame(width: 344)
+        .frame(width: 372)
         .background {
             ZStack {
                 Rectangle().fill(.ultraThinMaterial)
@@ -46,14 +112,16 @@ private struct SafeAwakeMenu: View {
                 )
             }
         }
-        .animation(AwakeTheme.Motion.snappy, value: controller.isActive)
-        .animation(AwakeTheme.Motion.smooth, value: controller.feedbackMessage)
+        .animation(reduceMotion ? nil : AwakeTheme.Motion.snappy, value: controller.isActive)
         .onAppear { controller.refreshPowerState() }
+        .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
+            controller.refresh()
+        }
     }
 
     private var statusCard: some View {
         HStack(spacing: 12) {
-            TimelineView(.periodic(from: .now, by: 1)) { context in
+            TimelineView(.periodic(from: .now, by: 30)) { context in
                 StatusRing(
                     isActive: controller.isActive,
                     fraction: controller.remainingFraction(now: context.date)
@@ -61,11 +129,11 @@ private struct SafeAwakeMenu: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(controller.isActive ? "Mac 保持唤醒中" : "Mac 可正常休眠")
-                    .font(.system(size: 14, weight: .semibold))
+                Text(controller.isActive ? "正在保持唤醒" : "准备好继续工作")
+                    .font(.system(size: 16, weight: .semibold))
                 TimelineView(.periodic(from: .now, by: 30)) { context in
                     Text(statusDetail(at: context.date))
-                        .font(.system(size: 10.5))
+                        .font(.system(size: 12))
                         .foregroundStyle(AwakeTheme.textSecondary)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
@@ -109,6 +177,15 @@ private struct SafeAwakeMenu: View {
                     }
                 }
             }
+            if controller.isActive, let deadline = controller.expiresAt {
+                HStack {
+                    Text("结束于 \(deadline.formatted(date: .omitted, time: .shortened))")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("+30 分钟") { controller.extendSession() }
+                        .buttonStyle(.bordered).controlSize(.small)
+                }
+            }
         }
         .awakeCard()
     }
@@ -127,7 +204,7 @@ private struct SafeAwakeMenu: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("仅接通电源时运行")
                     .font(.system(size: 11, weight: .medium))
-                Text(controller.isOnACPower ? "当前已接通电源" : "当前使用电池供电")
+                Text(controller.isOnACPower ? "当前已接通电源" : "电池 \(controller.batteryPercent.map { "\($0)%" } ?? "未知") · 20% 时停止")
                     .font(.system(size: 9.5))
                     .foregroundStyle(AwakeTheme.textSecondary)
             }
@@ -149,17 +226,20 @@ private struct SafeAwakeMenu: View {
             Button {
                 controller.sleepDisplayNow()
             } label: {
-                Label("关闭显示器，任务继续运行", systemImage: "display")
+                Label(controller.isActive ? "熄灭屏幕，继续运行" : "开始保持唤醒并熄屏", systemImage: "display")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .tint(AwakeTheme.accent)
             .controlSize(.regular)
             .clipShape(Capsule())
-            .disabled(!controller.isActive)
+            if controller.isActive {
+                Button("结束保持唤醒") { controller.stop() }
+                    .buttonStyle(.bordered).frame(maxWidth: .infinity)
+            }
 
-            Label("仅阻止闲置睡眠；物理合盖仍会正常睡眠。", systemImage: "lock.shield")
-                .font(.system(size: 9.5))
+            Label("保持上盖打开 · 屏幕可正常熄灭", systemImage: "laptopcomputer")
+                .font(.system(size: 12))
                 .foregroundStyle(AwakeTheme.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -168,7 +248,7 @@ private struct SafeAwakeMenu: View {
 
     private var footer: some View {
         HStack {
-            Text("SafeAwake 0.2.0")
+            Text("SafeAwake 0.3.0")
                 .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
             Spacer()
@@ -240,7 +320,7 @@ private struct DurationChip: View {
     var body: some View {
         Button(action: action) {
             Text(option.compactLabel)
-                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .foregroundStyle(isSelected ? Color.white : Color.primary.opacity(0.72))
                 .padding(.horizontal, 9)
                 .padding(.vertical, 6)
@@ -275,7 +355,7 @@ private struct FeedbackBadge: View {
                 .lineLimit(2)
             Spacer(minLength: 0)
         }
-        .font(.system(size: 10, weight: .medium))
+        .font(.system(size: 12, weight: .medium))
         .foregroundStyle(tint)
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
