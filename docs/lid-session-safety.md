@@ -1,7 +1,8 @@
 # Single-use closed-lid sessions: safety gate (experimental)
 
-Status: policy model and tests only. **Not an operational closed-lid feature.**
-No privileged helper, authentication dialog, XPC endpoint, global power write,
+Status: policy model, local authentication adapter, and tests only.
+**Not an operational closed-lid feature.**
+No privileged helper, UI authentication flow, XPC endpoint, global power write,
 installation, or new UI toggle is included in this branch. Existing v0.3 behavior
 is unchanged. Do not market these unit tests as hardware-safety verification.
 
@@ -34,6 +35,24 @@ gating. Inputs are simulated observations. Challenge UUIDs are NOT credentials.
 Calling `authenticationSucceeded` is NOT proof of a real OS authentication.
 Calling `restorationVerified` is NOT proof of system restoration.
 
+`SessionAuthenticator` wraps the macOS LocalAuthentication API, creates a fresh
+context per request, sets the biometric reuse interval to zero, invalidates the
+context after completion/cancellation, rejects invalid durations, and rejects late
+success after cancellation or the 60-second authentication window. It uses
+`deviceOwnerAuthentication` (Touch ID/account password per the installed macOS SDK)
+rather than companion-device policies. It does not receive or retain passwords.
+This adapter is not wired to the policy model or shipping UI. Its return value is
+local app state, not transferable proof for a privileged helper. Automated tests
+use mock contexts; real Touch ID/password prompts and timeout invalidation still
+need interactive validation. Total local unit tests: 34.
+
+## Source-only development without signing
+
+Source development, builds, unit tests, and GitHub pushes do not require a paid
+developer identity. The unsigned/ad-hoc development path must not install or
+activate privileged closed-lid behavior. No signing bypass is included. The
+existing standard idle-sleep mode remains usable under its original limitations.
+
 ## Required trusted implementation before enabling
 
 1. **Signing:** Developer ID signed app and helper, hardened runtime, notarization
@@ -48,9 +67,9 @@ Calling `restorationVerified` is NOT proof of system restoration.
    pending prompts on cancellation/disconnect. Establish how verified OS evidence
    is bound to the helper-generated nonce, exact duration, caller, and expiry.
    Do NOT expose an `authenticated: true` IPC flag. Validate password and Touch ID
-   paths, including unavailable biometrics and cancellation. Apple's general
-   device-owner policy can allow other methods on some systems; enforce the
-   requested method set explicitly rather than promising it from a generic policy.
+   paths, including unavailable biometrics and cancellation. Verify the selected
+   device-owner policy's method set on each supported macOS release; do not opt
+   into companion-device policies without an explicit product decision.
 4. **Restoration:** before any change, atomically persist a root-owned, symlink-safe
    recovery journal of the exact prior setting and ownership. Abort if journal
    persistence fails. Refuse pre-existing disabled-sleep or ambiguous ownership.
