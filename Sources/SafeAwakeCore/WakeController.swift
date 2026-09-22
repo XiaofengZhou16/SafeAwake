@@ -31,10 +31,12 @@ public enum FeedbackTone: Sendable {
 public final class WakeController: NSObject, ObservableObject {
     @Published public private(set) var isActive = false
     @Published public private(set) var expiresAt: Date?
-    @Published public private(set) var statusMessage = "已关闭，Mac 可正常休眠"
+    @Published public private(set) var statusMessage = "SafeAwake 未阻止睡眠"
     @Published public private(set) var feedbackMessage: String?
     @Published public private(set) var feedbackTone: FeedbackTone = .success
     @Published public private(set) var isOnACPower = false
+    @Published public private(set) var batteryPercent: Int?
+    @Published public private(set) var menuBarText = ""
     @Published public var requiresACPower: Bool {
         didSet { defaults.set(requiresACPower, forKey: Self.requiresACPowerKey) }
     }
@@ -44,7 +46,7 @@ public final class WakeController: NSObject, ObservableObject {
 
     private let assertionManager: SleepAssertionManaging
     private let powerSource: PowerSourceProviding
-    private let displaySleeper: DisplaySleeper
+    private let displaySleeper: any DisplaySleeping
     private let defaults: UserDefaults
     private var monitorTimer: Timer?
     private var feedbackTimer: Timer?
@@ -56,7 +58,7 @@ public final class WakeController: NSObject, ObservableObject {
     public init(
         assertionManager: SleepAssertionManaging = ProcessInfoSleepAssertionManager(),
         powerSource: PowerSourceProviding = SystemPowerSourceProvider(),
-        displaySleeper: DisplaySleeper = DisplaySleeper(),
+        displaySleeper: any DisplaySleeping = DisplaySleeper(),
         defaults: UserDefaults = .standard
     ) {
         self.assertionManager = assertionManager
@@ -71,11 +73,19 @@ public final class WakeController: NSObject, ObservableObject {
             : defaults.bool(forKey: Self.requiresACPowerKey)
         super.init()
         self.isOnACPower = powerSource.isOnACPower
+        self.batteryPercent = powerSource.batteryPercent
     }
 
     @discardableResult
     public func start(now: Date = Date()) -> Bool {
+        refresh(now: now)
         guard !isActive else { return true }
+
+        if !isOnACPower && (batteryPercent == nil || batteryPercent! <= 20) {
+            statusMessage = batteryPercent == nil ? "无法确认电量，请连接电源" : "电量不足，请连接电源"
+            showFeedback(statusMessage, tone: .warning)
+            return false
+        }
 
         if requiresACPower && !powerSource.isOnACPower {
             statusMessage = "未启动：请先连接电源"
@@ -96,19 +106,21 @@ public final class WakeController: NSObject, ObservableObject {
             ? now.addingTimeInterval(TimeInterval(selectedDurationMinutes * 60))
             : nil
         statusMessage = activeStatusMessage(now: now)
+        updateMenuBar(now: now)
         showFeedback("保持唤醒已开启")
         startMonitoring()
         return true
     }
 
     public func stop(
-        reason: String = "已关闭，Mac 可正常休眠",
-        feedback: String? = "已恢复正常休眠"
+        reason: String = "SafeAwake 已停止阻止睡眠",
+        feedback: String? = "已停止；休眠时间由系统和其他 App 决定"
     ) {
         assertionManager.stop()
         isActive = false
         expiresAt = nil
         sessionDurationMinutes = nil
+        menuBarText = ""
         statusMessage = reason
         monitorTimer?.invalidate()
         monitorTimer = nil
@@ -125,25 +137,33 @@ public final class WakeController: NSObject, ObservableObject {
 
     public func refresh(now: Date = Date()) {
         isOnACPower = powerSource.isOnACPower
+        batteryPercent = powerSource.batteryPercent
         guard isActive else { return }
 
         if requiresACPower && !isOnACPower {
             stop(
-                reason: "电源已断开，已自动恢复正常休眠",
+                reason: "电源已断开，SafeAwake 已停止",
                 feedback: "电源断开，保持唤醒已安全关闭"
             )
             return
         }
 
+        if !isOnACPower && (batteryPercent == nil || batteryPercent! <= 20) {
+            stop(reason: "电量不足或无法读取，SafeAwake 已停止", feedback: "请接通电源后手动重新开启")
+            return
+        }
+
         if let expiresAt, now >= expiresAt {
-            stop(reason: "定时结束，Mac 可正常休眠", feedback: "定时结束，已恢复正常休眠")
+            stop(reason: "定时结束，SafeAwake 已停止", feedback: "定时结束，已释放保持唤醒请求")
             return
         }
 
         statusMessage = activeStatusMessage(now: now)
+        updateMenuBar(now: now)
     }
 
     public func setDuration(minutes: Int, now: Date = Date()) {
+        refresh(now: now)
         let option = WakeDuration.option(for: minutes)
         selectedDurationMinutes = option.minutes
         guard isActive else { return }
@@ -153,11 +173,29 @@ public final class WakeController: NSObject, ObservableObject {
             ? now.addingTimeInterval(TimeInterval(option.minutes * 60))
             : nil
         statusMessage = activeStatusMessage(now: now)
+        updateMenuBar(now: now)
         showFeedback("持续时间已调整为\(option.label)")
     }
 
     public func refreshPowerState() {
-        isOnACPower = powerSource.isOnACPower
+        refresh()
+    }
+
+    public func extendSession(now: Date = Date()) {
+        refresh(now: now)
+        guard isActive, let deadline = expiresAt else { return }
+        expiresAt = deadline.addingTimeInterval(30 * 60)
+        sessionDurationMinutes = (sessionDurationMinutes ?? 0) + 30
+        updateMenuBar(now: now)
+        statusMessage = activeStatusMessage(now: now)
+        showFeedback("已在原结束时间上追加 30 分钟")
+    }
+
+    private func updateMenuBar(now: Date) {
+        guard isActive else { menuBarText = ""; return }
+        guard let expiresAt else { menuBarText = "∞"; return }
+        let minutes = max(1, Int(ceil(expiresAt.timeIntervalSince(now) / 60)))
+        menuBarText = minutes < 60 ? "\(minutes)m" : String(format: "%d:%02d", minutes / 60, minutes % 60)
     }
 
     public func remainingText(now: Date = Date()) -> String? {
@@ -188,9 +226,11 @@ public final class WakeController: NSObject, ObservableObject {
     }
 
     public func sleepDisplayNow() {
+        // Recheck power and expiration before requesting display sleep.
+        guard start() else { return }
         do {
             try displaySleeper.sleepNow()
-            showFeedback("显示器已关闭，任务继续运行")
+            showFeedback("已请求熄屏；保持唤醒仍在运行")
         } catch {
             statusMessage = error.localizedDescription
             showFeedback(error.localizedDescription, tone: .warning)
@@ -199,20 +239,12 @@ public final class WakeController: NSObject, ObservableObject {
 
     private func startMonitoring() {
         monitorTimer?.invalidate()
-        monitorTimer = Timer.scheduledTimer(
-            timeInterval: 10,
-            target: self,
-            selector: #selector(monitorTimerFired),
-            userInfo: nil,
-            repeats: true
-        )
+        monitorTimer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refresh() }
+        }
         if let monitorTimer {
             RunLoop.main.add(monitorTimer, forMode: .common)
         }
-    }
-
-    @objc private func monitorTimerFired() {
-        refresh()
     }
 
     private func activeStatusMessage(now: Date) -> String {
@@ -220,7 +252,7 @@ public final class WakeController: NSObject, ObservableObject {
             return "持续保持唤醒，直至手动关闭"
         }
 
-        return "将在 \(remainingText(now: now) ?? "不到 1 分钟")后恢复正常休眠"
+        return "将在 \(remainingText(now: now) ?? "不到 1 分钟")后停止保持唤醒"
     }
 
     private func showFeedback(_ message: String, tone: FeedbackTone = .success) {

@@ -11,7 +11,11 @@ public enum DisplaySleepError: LocalizedError {
     }
 }
 
-public struct DisplaySleeper {
+public protocol DisplaySleeping {
+    func sleepNow() throws
+}
+
+public struct DisplaySleeper: DisplaySleeping {
     public init() {}
 
     public func sleepNow() throws {

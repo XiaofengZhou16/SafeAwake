@@ -2,6 +2,30 @@
 
 All notable changes to SafeAwake will be documented in this file.
 
+## [0.3.0] - 2026-09-22
+
+### Added
+
+- One-click start-and-display-sleep action with power checks.
+- Menu-bar countdown, end time, and additive 30-minute extension.
+- Battery safety cutoff at 20%, including unreadable battery state.
+- Reopenable control panel and explicit stop action.
+- Seven additional session-safety tests (14 total).
+
+### Changed
+
+- Collapsed secondary settings and guidance; stable-height inline feedback.
+- Clear distinction between releasing our assertion, system sleep, display sleep, and locking.
+- Refresh deadlines after system wake; weak monitoring timer capture.
+- Preserve preferences without automatically restoring active sessions.
+
+### Verified
+
+- Local release build and 14 automated tests passed.
+- Native UI start, extension, expanded guidance, and stop checked.
+- System assertion appeared on start and disappeared on stop.
+- Display-sleep sequencing tested with a mock; this iteration did not turn off the user's screen or test physical lid closure.
+
 ## [0.2.0] - 2026-09-22
 
 ### Added
